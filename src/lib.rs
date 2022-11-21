@@ -3,6 +3,7 @@ use std::env;
 use std::fmt::Display;
 use std::fs;
 use std::io::{self, prelude::*, BufReader, BufWriter};
+use std::ops::Deref;
 use std::path::{self, PathBuf};
 use std::string::FromUtf8Error;
 
@@ -72,22 +73,32 @@ impl From<FromUtf8Error> for VcsError {
 pub struct Cmd {
     name: String,
     arg: Option<String>,
+    // path: PathBuf
 }
 
 impl Cmd {
-    pub fn new() -> Result<Cmd, &'static str> {
+    pub fn new() -> Result<Cmd, VcsError> {
         let mut args = env::args();
         args.next(); // application name
 
         if args.len() < 1 || args.len() > 2 {
-            return Err(HELP);
+            return Err(VcsError::Usage(HELP));
         }
 
         Ok(Cmd {
             name: args.next().unwrap(),
             arg: args.next(),
+            // path: env::current_dir()?
         })
     }
+
+    // fn push<P: AsRef<Path>>(&mut self, path: P) {
+    //     self.path.push(path);
+    // }
+
+    // fn pop(&mut self) -> bool {
+
+    // }
 
     pub fn execute(&self) -> Result<(), VcsError> {
         let is_configured = self.get_author().is_ok();
@@ -118,7 +129,7 @@ impl Cmd {
     }
 
     fn get_author(&self) -> Result<String, VcsError> {
-        let mut path = self.get_default_path()?;
+        let mut path = get_default_path()?;
         path.push(VCS_DIR);
         path.push(CONFIG_FILE);
 
@@ -140,11 +151,11 @@ impl Cmd {
 
         match (&self.arg, is_configured) {
             (Some(name), _) => {
-                let mut path = self.get_default_path()?;
+                let mut path = get_default_path()?;
                 path.push(VCS_DIR);
                 path.push(CONFIG_FILE);
 
-                let conf_file = fs::OpenOptions::new().write(true).open(&path)?;
+                let conf_file = fs::OpenOptions::new().write(true).open(path)?;
                 let mut writter = BufWriter::new(&conf_file);
                 let _ = writter.write(name.as_bytes())?;
                 println!("The username is {name}.");
@@ -157,7 +168,7 @@ impl Cmd {
     }
 
     fn do_add(&self) -> Result<(), VcsError> {
-        let mut path = self.get_default_path()?;
+        let mut path = get_default_path()?;
 
         path.push(VCS_DIR);
         path.push(INDEX_FILE);
@@ -167,7 +178,7 @@ impl Cmd {
             .append(true)
             .open(&path)?;
 
-        let mut path = self.get_default_path()?;
+        let mut path = get_default_path()?;
         let file_name: &str = self.arg.as_deref().unwrap_or("");
 
         if !file_name.is_empty() {
@@ -215,24 +226,11 @@ impl Cmd {
     }
 
     fn do_commit(&self) -> Result<(), VcsError> {
-        let mut path = self.get_default_path()?;
-
-        path.push(VCS_DIR);
-        path.push(INDEX_FILE);
-
-        let index_file = fs::OpenOptions::new().read(true).open(&path)?;
-
-        let reader = BufReader::new(&index_file);
-        let mut tracked_files: Vec<String> = reader
-            .lines()
-            .map(|l| l.expect("Could not parse the index.txt"))
-            .collect();
+        let mut tracked_files = self.get_lines_from_file(INDEX_FILE)?;
 
         if tracked_files.is_empty() {
             return Err(VcsError::Usage("You need to add files first."));
         }
-
-        path.pop(); // INDEX_FILE
 
         tracked_files.sort();
         let mut hasher = Sha256::new();
@@ -242,15 +240,7 @@ impl Cmd {
         }
 
         let hash = format!("{:x}", hasher.finalize());
-
-        path.push(COMMIT_FILE);
-        let commit_file = fs::OpenOptions::new().read(true).open(&path)?;
-
-        let reader = BufReader::new(&commit_file);
-        let commits: Vec<String> = reader
-            .lines()
-            .map(|l| l.expect("Could not parse the commit.txt"))
-            .collect();
+        let commits = self.get_lines_from_file(COMMIT_FILE)?;
 
         if !commits.is_empty() && hash.eq(commits.first().unwrap()) {
             return Err(VcsError::Usage("Nothing changed since the last commit."));
@@ -259,10 +249,12 @@ impl Cmd {
         let mut updated_commits = vec![hash];
         updated_commits.extend(commits);
 
+        let mut path = get_default_path()?;
+        path.push(VCS_DIR);
+        path.push(COMMIT_FILE);
+
         let mut commit_file = fs::OpenOptions::new().write(true).open(&path)?;
-
         commit_file.write_all(updated_commits.join("\n").as_bytes())?;
-
         path.pop(); // COMMIT_FILE
 
         let hash = updated_commits.first().unwrap();
@@ -270,30 +262,12 @@ impl Cmd {
         path.push(hash);
         fs::create_dir_all(&path)?;
 
-        let mut src_path = self.get_default_path()?;
+        let mut src_path = get_default_path()?;
         let mut dst_path = path;
 
-        for file_name in &tracked_files {
-            src_path.push(file_name);
-            dst_path.push(file_name);
+        self.copy_files(&mut src_path, &mut dst_path, tracked_files)?;
 
-            fs::copy(&src_path, &dst_path)?;
-            src_path.pop();
-            dst_path.pop();
-        }
-
-        let mut path = src_path;
-        path.push(VCS_DIR);
-        path.push(LOG_FILE);
-
-        let log_file = fs::OpenOptions::new().read(true).open(&path)?;
-
-        let reader = BufReader::new(&log_file);
-        let log: Vec<String> = reader
-            .lines()
-            .map(|l| l.expect("Could not parse the log.txt"))
-            .collect();
-
+        let log = self.get_lines_from_file(LOG_FILE)?;
         let mut new_log = vec![
             format!("commit {hash}"),
             format!("Author: {}", self.get_author()?),
@@ -302,6 +276,9 @@ impl Cmd {
 
         new_log.extend(log);
 
+        let mut path = src_path;
+        path.push(VCS_DIR);
+        path.push(LOG_FILE);
         let mut log_file = fs::OpenOptions::new().write(true).open(&path)?;
         log_file.write_all(new_log.join("\n").as_bytes())?;
         path.pop(); // LOG_FILE
@@ -314,18 +291,8 @@ impl Cmd {
         Ok(())
     }
 
-    fn do_log(&self) -> Result<(), io::Error> {
-        let mut path = self.get_default_path()?;
-        path.push(VCS_DIR);
-        path.push(LOG_FILE);
-
-        let log_file = fs::OpenOptions::new().read(true).open(&path)?;
-
-        let reader = BufReader::new(&log_file);
-        let log: Vec<String> = reader
-            .lines()
-            .map(|l| l.expect("Could not parse the log."))
-            .collect();
+    fn do_log(&self) -> Result<(), VcsError> {
+        let log = self.get_lines_from_file(LOG_FILE)?;
 
         for line in log {
             println!("{line}");
@@ -335,17 +302,7 @@ impl Cmd {
     }
 
     fn do_checkout(&self) -> Result<(), VcsError> {
-        let mut path = self.get_default_path()?;
-        path.push(VCS_DIR);
-        path.push(COMMIT_FILE);
-
-        let commit_file = fs::OpenOptions::new().read(true).open(&path)?;
-
-        let reader = BufReader::new(&commit_file);
-        let commits: Vec<String> = reader
-            .lines()
-            .map(|l| l.expect("Could not parse the commit.txt"))
-            .collect();
+        let commits = self.get_lines_from_file(COMMIT_FILE)?;
 
         if commits.is_empty() {
             return Err(VcsError::Usage("Repository does not have any commits."));
@@ -359,33 +316,67 @@ impl Cmd {
             )));
         }
 
-        path.pop(); // COMMIT_FILE
         let commit_id = commit.unwrap();
+        let mut path = get_default_path()?;
+        path.push(VCS_DIR);
         path.push(COMMIT_DIR);
         path.push(commit_id);
 
-        let src_path = path;
-        let mut dsc_path = self.get_default_path()?;
+        let mut src_path = path;
+        let mut dst_path = get_default_path()?;
 
-        let paths = fs::read_dir(src_path)?;
-        for file in paths {
-            let file_entry = file.unwrap();
-            let file_name = &file_entry.file_name();
-            let file_path = &file_entry.path();
-            dsc_path.push(file_name);
-            fs::copy(file_path, &dsc_path)?;
-            dsc_path.pop();
-        }
+        let paths = fs::read_dir(&src_path)?;
+        let file_names: Vec<String> = paths
+            .map(|x| {
+                x.unwrap_or_else(|_| {
+                    panic!(
+                        "Error when reading directory: {}",
+                        src_path.to_string_lossy()
+                    )
+                })
+            })
+            .map(|x| {
+                x.file_name()
+                    .into_string()
+                    .expect("Can't convert OsString into String")
+            })
+            .collect();
+
+        self.copy_files(&mut src_path, &mut dst_path, file_names)?;
 
         println!("Commit with ID: {} checked out succesfully.", commit_id);
 
         Ok(())
     }
 
-    fn get_default_path(&self) -> Result<PathBuf, io::Error> {
-        let path = env::current_dir()?;
+    fn copy_files(
+        &self,
+        src_path: &mut PathBuf,
+        dst_path: &mut PathBuf,
+        file_names: Vec<String>,
+    ) -> Result<(), VcsError> {
+        for file_name in file_names {
+            src_path.push(&file_name);
+            dst_path.push(file_name);
+            fs::copy(&src_path, &dst_path)?;
+            src_path.pop();
+            dst_path.pop();
+        }
 
-        Ok(path)
+        Ok(())
+    }
+
+    fn get_lines_from_file(&self, file_name: &'static str) -> Result<Vec<String>, VcsError> {
+        let mut path = get_default_path()?;
+        path.push(VCS_DIR);
+        path.push(file_name);
+
+        let file = fs::OpenOptions::new().read(true).open(&path)?;
+        let reader = BufReader::new(file);
+        let error_msg = format!("Could not parse {}", file_name.deref());
+        let file_lines: Vec<String> = reader.lines().map(|l| l.expect(&error_msg)).collect();
+
+        Ok(file_lines)
     }
 
     fn update_hash_with_context(
@@ -393,7 +384,7 @@ impl Cmd {
         hasher: &mut Sha256,
         file_name: &String,
     ) -> Result<(), io::Error> {
-        let mut path = self.get_default_path()?;
+        let mut path = get_default_path()?;
 
         path.push(file_name);
         let file = fs::OpenOptions::new().read(true).open(&path)?;
@@ -411,6 +402,12 @@ impl Cmd {
 
         Ok(())
     }
+}
+
+fn get_default_path() -> Result<PathBuf, io::Error> {
+    let path = env::current_dir()?;
+
+    Ok(path)
 }
 
 pub fn setup_dir_structure() -> Result<(), io::Error> {
@@ -432,4 +429,77 @@ pub fn setup_dir_structure() -> Result<(), io::Error> {
     fs::create_dir_all(&path)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::panic;
+
+    struct Setup {
+        default_path: PathBuf,
+    }
+
+    impl Setup {
+        fn new() -> Setup {
+            let path = get_default_path().unwrap();
+            fs::create_dir_all(&path).unwrap();
+
+            Setup { default_path: path }
+        }
+
+        fn create_env_for(self, cmd: &'static str) {}
+
+        // fn teardown(self) {
+        //     println!("I'm melting! Meeeelllllttttinnnng!");
+        //     fs::remove_dir_all(&self.default_path).unwrap();
+        // }
+    }
+
+    impl Drop for Setup {
+        fn drop(&mut self) {
+            println!("I'm melting! Meeeelllllttttinnnng!");
+            fs::remove_dir_all(&self.default_path).unwrap();
+        }
+    }
+
+    fn get_default_path() -> Result<PathBuf, io::Error> {
+        let mut path = env::temp_dir();
+        path.push("vcs_test_dir");
+
+        Ok(path)
+    }
+
+    fn run_test<T>(cmd: &'static str, test: T)
+    where
+        T: FnOnce() + panic::UnwindSafe,
+    {
+        let setup = Setup::new();
+        setup.create_env_for(cmd);
+
+        let result = panic::catch_unwind(|| test());
+
+        // setup.teardown();
+
+        assert!(result.is_ok())
+    }
+
+    #[test]
+    #[serial]
+    fn test_default_path() {
+        run_test("", || {
+            let path = get_default_path().unwrap();
+
+            assert!(path.to_str().unwrap().contains("vcs_test_dir"));
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn test_panic() {
+        run_test("", || {
+            panic!("Just for a test");
+        })
+    }
 }
